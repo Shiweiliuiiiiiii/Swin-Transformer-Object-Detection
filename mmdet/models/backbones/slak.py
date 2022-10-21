@@ -203,26 +203,14 @@ class SLaK(BaseModule):
                  width_factor=1,
                  LoRA=None,
                  out_indices=[0, 1, 2, 3],
-                 pretrained=None,
-                 init_cfg=None,
                  sparse=None):
-        assert not (init_cfg and pretrained), \
-            'init_cfg and pretrained cannot be specified at the same time'
-        if isinstance(pretrained, str):
-            warnings.warn('DeprecationWarning: pretrained is deprecated, '
-                          'please use "init_cfg" instead')
-            init_cfg = dict(type='Pretrained', checkpoint=pretrained)
-        elif pretrained is None:
-            init_cfg = init_cfg
-        else:
-            raise TypeError('pretrained must be a str or None')
-
-        super(SLaK, self).__init__(init_cfg=init_cfg)
+        super().__init__()
 
         dims = [int(x * width_factor) for x in dims]
         self.kernel_size = kernel_size
         self.out_indices = out_indices
         self.sparse = sparse
+
         self.downsample_layers = nn.ModuleList()  # stem and 3 intermediate downsampling conv layers
         stem = nn.Sequential(
             nn.Conv2d(in_chans, dims[0], kernel_size=4, stride=4),
@@ -248,6 +236,7 @@ class SLaK(BaseModule):
             self.stages.append(stage)
             cur += depths[i]
 
+        self.out_indices = out_indices
         # self.norm = nn.LayerNorm(dims[-1], eps=1e-6) # final norm layer
         # self.head = nn.Linear(dims[-1], num_classes)
 
@@ -269,66 +258,90 @@ class SLaK(BaseModule):
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
 
-    def init_weights(self):
-        logger = get_root_logger()
-        if self.init_cfg is None:
-            logger.warn(f'No pre-trained weights for '
-                        f'{self.__class__.__name__}, '
-                        f'training start from scratch')
-            for m in self.modules():
-                if isinstance(m, nn.Linear):
-                    trunc_normal_(m.weight, std=.02)
-                    if isinstance(m, nn.Linear) and m.bias is not None:
-                        nn.init.constant_(m.bias, 0)
-                elif isinstance(m, nn.LayerNorm):
+    def init_weights(self, pretrained=None):
+        """Initialize the weights in backbone.
+        Args:
+            pretrained (str, optional): Path to pre-trained weights.
+                Defaults to None.
+        """
+        def _init_weights(m):
+            if isinstance(m, nn.Linear):
+                trunc_normal_(m.weight, std=.02)
+                if isinstance(m, nn.Linear) and m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-                    nn.init.constant_(m.weight, 1.0)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.constant_(m.bias, 0)
+                nn.init.constant_(m.weight, 1.0)
+
+        if isinstance(pretrained, str):
+            self.apply(_init_weights)
+            logger = get_root_logger()
+            load_checkpoint(self, pretrained, strict=False, logger=logger)
+        elif pretrained is None:
+            self.apply(_init_weights)
         else:
-            assert 'checkpoint' in self.init_cfg, f'Only support ' \
-                                                  f'specify `Pretrained` in ' \
-                                                  f'`init_cfg` in ' \
-                                                  f'{self.__class__.__name__} '
-            ckpt = CheckpointLoader.load_checkpoint(
-                self.init_cfg['checkpoint'], logger=logger, map_location='cpu')
-            if 'teacher' in ckpt: # for dino-like ssl learning
-                ckpt = ckpt['teacher']
-            if 'state_dict' in ckpt:
-                _state_dict = ckpt['state_dict']
-            elif 'model' in ckpt:
-                _state_dict = ckpt['model']
-            else:
-                _state_dict = ckpt
-
-            # strip prefix of state_dict
-            if list(_state_dict.keys())[0].startswith('module.'):
-                _state_dict = {k[7:]: v for k, v in _state_dict.items()}
-
-            state_dict = OrderedDict()
-            for k, v in _state_dict.items():
-                if k.startswith('backbone.'):
-                    state_dict[k[9:]] = v
-                else:
-                    state_dict[k] = v
+            raise TypeError('pretrained must be a str or None')
 
 
-            # load state_dict
-            load_state_dict(self, state_dict, strict=False, logger=logger)
-
-            if self.sparse:
-                self.masks = {}
-                for name, weight in self.named_parameters():
-                    if len(weight.size()) == 2 or len(weight.size()) == 4:
-                        self.masks[name] = torch.zeros_like(weight, dtype=torch.float32, requires_grad=False).to('cuda')
-
-                for name, weight in self.named_parameters():
-                    if name in self.masks:
-                        self.masks[name][:] = (weight != 0.0).float().data.to('cuda')
-                        print(f"density of {name} is {(self.masks[name] != 0).sum().item() / weight.numel()}")
-
-    def apply_mask(self):
-        for name, weight in self.named_parameters():
-            if name in self.masks:
-                weight.data = weight.data * self.masks[name].to(weight.device)
+        # logger = get_root_logger()
+        # if self.init_cfg is None:
+        #     logger.warn(f'No pre-trained weights for '
+        #                 f'{self.__class__.__name__}, '
+        #                 f'training start from scratch')
+        #     for m in self.modules():
+        #         if isinstance(m, nn.Linear):
+        #             trunc_normal_(m.weight, std=.02)
+        #             if isinstance(m, nn.Linear) and m.bias is not None:
+        #                 nn.init.constant_(m.bias, 0)
+        #         elif isinstance(m, nn.LayerNorm):
+        #             nn.init.constant_(m.bias, 0)
+        #             nn.init.constant_(m.weight, 1.0)
+        # else:
+        #     assert 'checkpoint' in self.init_cfg, f'Only support ' \
+        #                                           f'specify `Pretrained` in ' \
+        #                                           f'`init_cfg` in ' \
+        #                                           f'{self.__class__.__name__} '
+        #     ckpt = CheckpointLoader.load_checkpoint(
+        #         self.init_cfg['checkpoint'], logger=logger, map_location='cpu')
+        #     if 'teacher' in ckpt: # for dino-like ssl learning
+        #         ckpt = ckpt['teacher']
+        #     if 'state_dict' in ckpt:
+        #         _state_dict = ckpt['state_dict']
+        #     elif 'model' in ckpt:
+        #         _state_dict = ckpt['model']
+        #     else:
+        #         _state_dict = ckpt
+        #
+        #     # strip prefix of state_dict
+        #     if list(_state_dict.keys())[0].startswith('module.'):
+        #         _state_dict = {k[7:]: v for k, v in _state_dict.items()}
+        #
+        #     state_dict = OrderedDict()
+        #     for k, v in _state_dict.items():
+        #         if k.startswith('backbone.'):
+        #             state_dict[k[9:]] = v
+        #         else:
+        #             state_dict[k] = v
+        #
+        #
+        #     # load state_dict
+        #     load_state_dict(self, state_dict, strict=False, logger=logger)
+        #
+        #     if self.sparse:
+        #         self.masks = {}
+        #         for name, weight in self.named_parameters():
+        #             if len(weight.size()) == 2 or len(weight.size()) == 4:
+        #                 self.masks[name] = torch.zeros_like(weight, dtype=torch.float32, requires_grad=False).to('cuda')
+        #
+        #         for name, weight in self.named_parameters():
+        #             if name in self.masks:
+        #                 self.masks[name][:] = (weight != 0.0).float().data.to('cuda')
+        #                 print(f"density of {name} is {(self.masks[name] != 0).sum().item() / weight.numel()}")
+    #
+    # def apply_mask(self):
+    #     for name, weight in self.named_parameters():
+    #         if name in self.masks:
+    #             weight.data = weight.data * self.masks[name].to(weight.device)
 
     def forward_features(self, x):
         if self.sparse:
